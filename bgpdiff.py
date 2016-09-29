@@ -8,35 +8,204 @@ import re
 import math
 import numpy as np
 import arrow
+import cPickle as pickle
+import os.path
+from _pybgpstream import BGPStream, BGPRecord, BGPElem
 from collections import Counter
 
-# config
+def load_from_pickle( peer_def, who, r ):
+   fname = "./data/%s.%s.%s.%s.pickle" % tuple( peer_def )
+   try:
+      r[ who ] = pickle.load( open( fname, "rb" ) )
+      print >>sys.stderr, "loaded data from %s" % ( fname )
+   except:
+      raise
+   return r
+
+def save_to_pickle( who, r ):
+   '''
+   check if there is already a pickle file, if not, create it
+   '''
+   peer_def = r[who]['peer_def_raw'] # 4 components
+   fname = "./data/%s.%s.%s.%s.pickle" % tuple( peer_def )
+   if not os.path.isfile(fname):
+      print >>sys.stderr, "saving data to %s" % ( fname )
+      pickle.dump( r[who], open( fname, "wb" ) )
+
+def fetch_from_file( collector, ts, r ):
+   ''' 
+   for now assume data is in a specific location on the local filesystem
+   ./data/<rc>.<ts>.* # see 'fetch script'
+   ''' 
+   ext = 'bz2'
+   if collector.startswith('rrc'):
+      ext = 'gz'
+   fname = "./data/%s.%s.%s" % (
+      collector,
+      ts.format('YYYY-MM-DD.HHmm'),
+      ext
+   )
+   # now see what peer we have to watch at what position in our res
+   peer2who = {} # contains (ASN,PEER_IP) tuple map to the index in results
+   for who in (1,2):
+      if r[ who ]['route_collector'] == collector and r[ who ]['ts'] == ts:
+         peer_id = ( r[ who ]['peer_asn'] , r[ who ]['peer_ip'] )
+         peer2who[ peer_id ] = who
+   #TODO load from pickle file to speed things up?
+   # now open file and collect stats over it
+   cmd = "%s -m -v -t change %s" % ( CMD_BGPDUMP, fname )
+   print >>sys.stderr, "executing %s" % cmd
+   for line in subprocess.Popen(cmd, shell=True, bufsize=1024*8, stdout=subprocess.PIPE).stdout:
+      # 3 = ASN_IP , 4 = ASN , 5 = PFX , 6 = path
+      who=None
+      try:
+         fields = line.split('|')
+         peer_id = ( fields[4], fields[3] )
+         if peer_id in peer2who:
+            who = peer2who[ peer_id ]
+         else:
+            continue #this is not the peer you are looking for
+      except:
+         print >>sys.stderr,"EEP"
+         continue
+      try: 
+         last_change_ts = int(fields[1])
+         ts_5m = (last_change_ts / 300 ) * 300
+         pfx = fields[5]
+         asn = fields[6]
+         asns = asn.split(" ")
+         if asns[0] == r[who]['peer_asn']:
+            asns = asns[1:]
+         node = r[who]['radix'].search_exact( pfx )
+         if node:
+            raise "BGP DATA CONTAINS DUPLICATES; SHOULD NOT HAPPEN: PFX %s" % ( pfx, )
+         else:
+            newnode = r[who]['radix'].add( pfx )
+            newnode.data['aspath'] = asns
+            newnode.data['fields'] = fields
+
+         # path length and prepending
+         path_len = len( asns )
+         if path_len > MAX_REPORTED_PATH_LEN:
+            path_len = MAX_REPORTED_PATH_LEN
+
+         asn_count = len( set( asns ) )
+         if asn_count > MAX_REPORTED_PATH_LEN:
+            asn_count = MAX_REPORTED_PATH_LEN
+
+         if asn_count != path_len:
+            r[who]['asn_xpending'] += 1
+
+         r[who]['path_len_cnt'][ path_len ] += 1
+         r[who]['path_asn_cnt'][ asn_count ] += 1
+
+      except:
+         print >>sys.stderr,"EEP2"
+         continue
+   return r
+
+def init_result():  
+   '''
+   initialises the structure that hold data for collector peers to be compared
+   '''
+   r = {}
+   for who in (1,2):
+      r[ who ] = {}
+      r[ who ]['radix'] = Radix() # holds the radix trees for both
+      r[ who ]['path_len_cnt'] = Counter() # path length counter
+      r[ who ]['path_asn_cnt'] = Counter() # number of ASNs counter (different from path length because of prepending
+      r[ who ]['asn_xpending'] = 0 # covers inpending, prepending (ie. where path_len != asn_count
+   return r
+
+def print_header( r ):
+   print "COMPARING A:%s to B:%s" % ( r[1]['peer_asn'], r[2]['peer_asn'] )
+   print "     TIME A:%s to B:%s" % ( r[1]['ts'], r[2]['ts'] )
+
+def print_prefix_stats( r, set1, set2, missing_from1_naked, missing_from2_naked ):
+   print "Prefix counts:      A: %d     B: %d" % ( len(set1), len(set2) )
+   print "       unique in:   A: %d     B: %d" % ( len(set1-set2), len(set2-set1) )
+   print "missing+naked in:   A: %d     B: %d" % ( len(missing_from1_naked), len(missing_from2_naked) )
+
+def print_path_len_stats( r, pfxset1_size, pfxset2_size ):
+   print "path lengths in A vs B"
+   for plen in range(0, MAX_REPORTED_PATH_LEN+1):
+      if plen == MAX_REPORTED_PATH_LEN:
+         plen_str = ">=%s" % plen
+      else:
+         plen_str = "%-2s" % plen
+      plen1 = r[1]['path_len_cnt'][ plen ]
+      plen2 = r[2]['path_len_cnt'][ plen ]
+      print "  {:<3} {:>8} ({:.1%}) {:>8} ({:.1%})".format(plen_str, 
+         plen1, plen1*100/pfxset1_size, 
+         plen2, plen2*100/pfxset2_size )
+
+   print "ASNs per path in A vs B"
+   for plen in range(0, MAX_REPORTED_PATH_LEN+1):
+      if plen == MAX_REPORTED_PATH_LEN:
+         plen_str = ">=%s" % plen
+      else:
+         plen_str = "%-2s" % plen
+      plen1 = r[1]['path_asn_cnt'][ plen ]
+      plen2 = r[2]['path_asn_cnt'][ plen ]
+      print "  {:<3} {:>8} ({:.1%}) {:>8} ({:.1%})".format(plen_str, 
+         plen1, 1.0*plen1/pfxset1_size, 
+         plen2, 1.0*plen2/pfxset2_size )
+
+def missing_and_naked( r, set1, set2 ):
+   missing_from1_naked = set() # these are the set of prefixes missing in set1 (ie. uniq to set 2) that are not covered by a less specific
+   missing_from2_naked = set() #  '' set2
+   for pfx in set1 - set2: # prefixes uniq to set 1
+      node = r[2]['radix'].search_best( pfx )
+      if not node:
+         missing_from2_naked.add( pfx )
+   for pfx in set2 - set1: # prefixes uniq to set 2
+      node = r[1]['radix'].search_best( pfx )
+      if not node:
+         missing_from1_naked.add( pfx )
+   return (missing_from1_naked,missing_from2_naked)
+
+def main():
+   r = init_result() # r = the results data structure that will hold info on our peers
+   file_defs = set()
+   for who in (1,2):
+      # fields are 0:ASN,1:PEER_IP,2:ROUTE COLLECTOR NAME,3:timestamp
+      peer_def = sys.argv[ who ].split(',')
+      r[ who ]['peer_def_raw'] = peer_def
+      # normalize timestamps to 8hr interval
+      r[ who ]['peer_asn'] = peer_def[0]
+      r[ who ]['peer_ip']  = peer_def[1]
+      r[ who ]['route_collector'] = peer_def[2]
+      r[ who ]['ts'] = arrow.get( peer_def[ 3 ] ) # int( arrow.get( peer_def[3] ).timestamp / 8*3600 ) * 8*3600
+      # see if we can load from pickle
+      try:
+         r = load_from_pickle( peer_def, who, r )
+      except:
+         file_defs.add( ( r[ who ]['route_collector'] , r[ who ]['ts'] ) )
+   for file_def in file_defs:
+      r = fetch_from_file( file_def[0], file_def[1], r )
+   for who,struct in r.iteritems():
+      save_to_pickle( who, r )
+
+   ### data is loaded, now do analysis and print the results
+   pfxset1 = set( r[1]['radix'].prefixes() )
+   pfxset2 = set( r[2]['radix'].prefixes() )
+
+   (missing1_naked, missing2_naked) = missing_and_naked( r, pfxset1, pfxset2 )
+
+   print_header( r )
+   print_prefix_stats( r, pfxset1, pfxset2, missing1_naked, missing2_naked )
+   print_path_len_stats( r, len(pfxset1), len(pfxset2) )
+   
+
 CMD_BGPDUMP="/Users/emile/bin/bgpdump"
-#ROUTES_FILE="./bview.20160715.0000.gz"
-#ROUTES_FILES=["rib.20160901.0000.bz2"]
-ROUTES_FILES=["bview.rrc00.20160920.0800.gz"]
-#DUMP_TS=arrow.get('2016-09-01T00:00:00Z').timestamp
-
-#ID1='195.66.224.138|2914'
-#ID2='195.66.224.51|6453'
-ID1='12.0.1.63|7018'  
-ID2='193.0.0.56|3333'
-
-ASN_IP1,ASN1 = ID1.split('|')
-ASN_IP2,ASN2 = ID2.split('|')
-
-#ASN1="2497"
-#ASN_IP1="198.32.160.42"
-#ASN2="13030"
-#ASN_IP2="198.32.160.103"
-#ASN2="6939"
-#ASN_IP2="198.32.160.61"
-#ASN2="9002"
-#ASN_IP2="198.32.160.182"
-###
-
 MAX_REPORTED_PATH_LEN=6
 
+if __name__ == '__main__':
+   main()
+
+sys.exit(0)
+
+### OLD
 peers = Counter()
 tree = {1: Radix(), 2: Radix()}
 meta = {}
@@ -44,27 +213,12 @@ for who in (1,2):
    meta[ who ] = {}
    meta[ who ]['path_len_cnt'] = Counter()
    meta[ who ]['path_asn_cnt'] = Counter()
-   meta[ who ]['age'] = Counter()
    meta[ who ]['asn_xpending'] = 0 # covers inpending, prepending
+   meta[ who ]['age'] = Counter()
 meta[1]['asn'] = ASN1
 meta[2]['asn'] = ASN2
 
-CMD = "%s -m -v -t change %s" % ( CMD_BGPDUMP, ' '.join(ROUTES_FILES) )
-for line in subprocess.Popen(CMD, shell=True, bufsize=1024*8, stdout=subprocess.PIPE).stdout:
-   # 3 = ASN_IP , 4 = ASN , 5 = PFX , 6 = path
-   who=None
-   try:
-      fields = line.split('|')
-      if fields[3] == ASN_IP1 and fields[4] == ASN1:
-         who=1
-      elif fields[3] == ASN_IP2 and fields[4] == ASN2:
-         who=2
-      else:
-         continue
-   except:
-      print >>sys.stderr,"EEP"
-      continue
-   try: 
+def aap():
       last_change_ts = int(fields[1])
       ts_5m = (last_change_ts / 300 ) * 300
       pfx = fields[5]
@@ -95,11 +249,6 @@ for line in subprocess.Popen(CMD, shell=True, bufsize=1024*8, stdout=subprocess.
          newnode = tree[who].add( pfx )
          newnode.data['aspath'] = asns
          newnode.data['fields'] = fields
-   except:
-      print >>sys.stderr,"EEP in loading"
-      raise
-      continue
-print >>sys.stderr, "PREFIXES LOADED"
 
 def percentiles_of_timestamps_of_pfxset( pfxset, tree):
    tss = []
